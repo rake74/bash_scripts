@@ -1,0 +1,43 @@
+#!/bin/bash
+
+yourDomain='example.com'
+
+case "$1" in
+  '' ) echo "Usage: $(basename $0) [hostname|ip]" && exit 1 ;;
+  *  ) node="$1"
+esac
+
+DNScheck () {
+  [ "x$1" = 'x' ] && return 1
+  host -t A "$1" | \
+  grep -q -e 'has address' -e 'domain name pointer'
+}
+
+portOpenCheck () {
+  [ "x$1" = 'x' ] && return 1
+  timeout 1 bash -c "</dev/tcp/$1/22" &> /dev/null && return 0 || return 1
+}
+
+# checkif looks like IP - if not, see if we can resolve
+ipregex='([1-9]?[0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])'
+if [[ $node =~ ^$ipregex\.$ipregex\.$ipregex\.$ipregex$ ]]; then
+  DNScheck $node || "will use $node address, but no reverse DNS is setup"
+else
+  if DNScheck $node.$yourDomain ; then
+    echo found $node.$yourDomain
+    node=$node.$yourDomain
+  else
+    echo could not resolve $node.$yourDomain, trying $node
+    if DNScheck $node ; then
+      echo found $node
+    else
+      echo "unable to resolve $node" && exit 1
+    fi
+  fi
+fi
+
+while ! portOpenCheck $node ; do
+  echo "$(date +'%F %T') | Waiting for $node 22 to become available..."
+  sleep 2
+done
+ssh -t $node 'cat /etc/motd 2>/dev/null ; sudo -i'
