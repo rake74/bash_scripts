@@ -4,24 +4,27 @@
 PS4='Line ${LINENO}: '
 # set -ex
 
-myname="$(basename $0)"
+myName="$(basename $0)"
 user_id=$(id -u)
 
 function usage () {
   cat << EOF
 Sets read_ahead_kb for all block devices used behind path.
 
-Usage: $myname [-s SIZE|-r] -p PATH
-   or: $myname -f SETTINGS-FILE
+Usage: $myName [-s SIZE|-r] -p PATH
+   or: $myName -f SETTINGS-FILE
 
 Options:
+  -p  - path to search for block devices behind
+        REQUIRED
+
   -s  - size to set for device via read_ahead_kb
 
   -r  - report the current read_ahead_kb setting and blockdev
         setting for each block device behind PATH
+        DEFAULT if -s unset
 
-  -p  - path to search for block devices behind
-        REQUIRED
+  -h  - Do not print header in 'report' output
 
   -f  - specify setting file
         if set, -s and -p options ignored as they're in the file
@@ -37,7 +40,7 @@ Notes:
   Without -s SIZE or -r, this will default to -r.
 
 Requires:
-  blockdev command, root privs.
+  blockdev command, root privs., column (for output)
 EOF
   echo
   exit
@@ -53,7 +56,7 @@ function is_integer () {
   esac
 }
 
-function echo_err      () { echo -e "$myname: $@" 1>&2 ; }
+function echo_err      () { echo -e "$myName: $@" 1>&2 ; }
 function echo_err_exit () { echo_err "$@" ; exit 1 ; }
 
 # this IDs all block devices behind path - multipath and lvm make for fun
@@ -125,11 +128,13 @@ function show_ra_kb_blocks () {
 function show_all_read_ahead_kb_block () {
   local show_all_dir="$1"
 
-  [ "x$show_all_dir" != 'x' ] && \
+  (
+  [ "x$show_all_dir" != 'x' ] && [ $noHeader -eq 0 ] && \
     echo 'dir dev read_ahead_kb blockdev_getra'
   for show_all_device in ${block_devices[@]}; do
     show_ra_kb_blocks "$show_all_device" "$show_all_dir"
   done
+  ) | column -t
 }
 
 # identify block to kb ratio
@@ -218,6 +223,7 @@ while [ $# -gt 0 ] ; do
                echo_err_exit "read_ahead_kb size is not an int: '$ra_kb_size'"
            ;;
     -r     ) report=1 ;;
+    -h     ) noHeader=1;;
     -f     ) settings_file="$1" ; shift
              [ ! -r $settings_file ] && \
                echo_err_exit "settings file '$settings_file' does not exist or is not readable"
@@ -232,6 +238,7 @@ done
 #
 # Usage is very different when called with a settings file, parse input sanely
 #
+[ "x$noHeader" = 'x' ]   && noHeader=0
 if [ "x$settings_file" != 'x' ] ; then
   parse_validate_settings_file
 else
@@ -260,7 +267,7 @@ for path_size_val in ${path_array[@]} ; do
     continue
 
   # report requested? 'ere ya go!
-  [ $report -eq 1 ] && show_all_read_ahead_kb_block ${path_size_val/:*} | column -t
+  [ $report -eq 1 ] && show_all_read_ahead_kb_block ${path_size_val/:*}
 
   # this would only happen if NOT using settings file and size not set
   [ "x${path_size_val/*:}" = 'x' ] && exit
@@ -273,5 +280,6 @@ for path_size_val in ${path_array[@]} ; do
   done
 
   # report requested? 'ere ya go again!
-  [ $report -eq 1 ] && show_all_read_ahead_kb_block ${path_size_val/:*}
+  [ $report -eq 1 ] && show_all_read_ahead_kb_block ${path_size_val/:*} | \
+    sed 's/$/ post-set-verification/g'
 done
