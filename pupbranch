@@ -1,0 +1,71 @@
+pupbranch () { 
+    unset NOOP ENABLE brancName branchNameRaw;
+    lockFile=/var/lib/puppet/state/agent_disabled.lock;
+    while [ $# -gt 0 ]; do
+        ARG="$1";
+        shift;
+        case "$ARG" in 
+            noop)
+                NOOP="--noop"
+            ;;
+            enable)
+                ENABLE="--enable"
+            ;;
+            *)
+                branchNameRaw="$ARG"
+            ;;
+        esac;
+    done;
+    if [ "x$ENABLE" == 'x--enable' -a "x$NOOP" == 'x' -a "xbranchNamwRaw" == 'x' ]; then
+        puppet agent --enable;
+        echo "puppet enabled";
+        return 0;
+    fi;
+    branchName="$(echo "$branchNameRaw" | sed 's/[/-]/_/g')";
+    [ "x$branchName" = 'x' ] && branchName='production';
+    disableMsg="on branch: $branchName";
+    if [ -e $lockFile -a "$branchName" != 'production' ]; then
+        disableMsgCur="$( cut -d: -f2- $lockFile | sed -e 's/^"//g' -e 's/"}$//g')";
+        if [[ $disableMsg != *"$branchName"* ]]; then
+            echo "Specified branch is not in puppet disable message: $disableMsg";
+            read -n1 -t60 -p "Continue with $branchName? (y/N): ";
+            echo;
+            [[ ! $REPLY =~ ^[Yy]$ ]] && return 1;
+        fi;
+    fi;
+    if [ -e /var/lib/puppet/state/agent_catalog_run.lock ]; then
+        echo "Puppet appears to be running.";
+        read -n1 -t60 -p "Shall I disable puppet so it won't run again? (y/N): ";
+        echo;
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            puppet agent --disable "holding for ${disableMsg#on }";
+            echo "puppet disabled w/ message \"holding for ${disableMsg#on }\"";
+        else
+            echo "Try again later.";
+            return 1;
+        fi;
+        return 0;
+    fi;
+    echo -e '\n\n';
+    puppet agent --enable 2>&1;
+    ( puppet agent -t --environment=$branchName $NOOP 2>&1;
+    echo $? > /tmp/pup-exit-code ) | while read line; do
+        echo -n "$(date +'%F %T') | ";
+        cat <<< $line;
+    done;
+    MyExit=$(cat /tmp/pup-exit-code);
+    if [ "x$ENABLE" = "x--enable" ]; then
+        echo "puppet left enabled";
+        echo -e '\n\n';
+        return $MyExit;
+    fi;
+    if [ "$branchName" == "production" -a "x$NOOP" == 'x' ]; then
+        echo "puppet left enabled";
+        echo -e '\n\n';
+        return $MyExit;
+    fi;
+    puppet agent --disable "$disableMsg";
+    echo "puppet disabled w/ msg: '$disableMsg'";
+    echo -e '\n\n';
+    return $MyExit
+}
