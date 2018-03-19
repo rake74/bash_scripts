@@ -1,28 +1,187 @@
 #!/bin/bash
 
-cjacobsRootrcVer='20170100.01'
+cjacobsRootrcVer='20170815.01'
 cjacobsRootrcMD5="$(md5sum $BASH_SOURCE | awk '{print $2" ("$1")"}')"
 
-pupbranch () {
-  unset ARGLIST
-  [ "$1" = 'noop' ] && ARGLIST="$ARGLIST --noop" && shift
+export sshopts='-o BatchMode=yes -o CheckHostIP=no -o ConnectTimeout=2 -o StrictHostKeyChecking=no -o KbdInteractiveAuthentication=no -o VerifyHostKeyDNS=no'
 
-  BranchName="$1"
-  [ "x$BranchName-" = 'x-' ] && BranchName='production'
+bareconf () { grep -v -e '^$' -e '^#' $@ ; }
 
-  echo -e '\n\n\n'
-  puppet agent --enable
-  puppet agent -t --environment=$BranchName $ARGLIST
-  MyExit=$?
-  [ "$BranchName" != "production" ] && puppet agent --disable "on branch: $BranchName"
-  echo -e '\n\n\n'
+blocknewconns () {
+  blocknewargs=''
+  while [[ $# > 0 ]] ; do
+    ARG="$1" ; shift
+    case $ARG in
+      '-s' ) blocknewargs="$blocknewargs -s $1" ; echo "blocking source IP $$1" ; shift ;;
+      '-d' ) blocknewargs="$blocknewargs --dport $1" ; echo "blocking destination port $1" ; shift ;;
+      *    ) echo "I do not understand $ARG. Sorry." ; return 1 ;;
+    esac
+  done
+  iptablesopts="-A INPUT -p tcp -m state --state NEW $blocknewargs -j REJECT --reject-with tcp-reset"
+  echo Implement:
+  echo $iptablesopts
+}
 
+cjacobs_pupbranch_usage () {
+  cat <<EOF
+ $0 [options]
+
+ noop         - perform noop run of puppet to see changes that would be made
+                disables puppet when done unless enable arg set after this
+ disable      - will disable puppet when done
+ enable       - will enable puppet when done
+                if only argument, will enable puppet and exit
+ noprompt     - do not prompt, default to 'no'
+ force        - do not prompt, default to 'yes'
+ options=[NN] - other puppet agent options (ex: --tags=[module])
+                include all extra options in a single options call, format
+                as the command line would expect.
+                ex: options="--tags=profile::base --server textbox"
+ [branchname] - all other arguments are treated as 'branchname'
+                defaults to 'production'
+                if production and disable arg NOT set, leave puppet enabled
+                branchname will convert hyphens and slashes to underscores
+
+ Notes:
+ Arguments are parsed in order, last taking effect.
+ Arguments 'disable' and 'enable' cancel the other.
+
+ When disabling puppet, will use msg: "on branch: [branchname]"
+
+ If current disable message does not include branch, and noop specified then
+ redisable puppet using original disable message.
+
+ Query events:
+ If current branchname is not "production" and current puppet disable message
+ does not include [branchname], it will prompt if you're sure.
+    Default: no
+
+ If puppet is found running, it will prompt if it should disable puppet using
+ the message: "holding for branch: [branchname]".
+    Default: no
+EOF
+  return 0
+}
+
+cjacobs_pupbranch () { 
+  # set vars/defaults
+  puppetState=/var/lib/puppet/state
+  disableLockFile=$puppetState/agent_disabled.lock
+  runningLockFile=$puppetState/agent_catalog_run.lock
+  ENABLE=99
+  NOOP=0
+  NOPROMPT=0
+  FORCE=0
+  BRANCH=production
+
+  # parse args
+  ArgCount=$#
+  while [ $# -gt 0 ]; do
+    ARG="$1" ; shift
+    case "$ARG" in 
+      noop)      NOOP=1 ; ENABLE=0          ;;
+      enable)    ENABLE=1                   ;;
+      disable)   ENABLE=0                   ;;
+      noprompt)  NOPROMPT=1 ; FORCE=0       ;;
+      force)     NOPROMPT=1 ; FORCE=1       ;;
+      options=*) PUPOPTS="${ARG#*=}"        ;;
+      -h|--help) pupbranch_usage ; return 0 ;;
+      *)         BRANCH="$ARG"              ;;
+    esac
+  done
+
+  # if called with just enable: then enable and quit
+  if [ $ENABLE -eq 1 -a $ArgCount -eq 1 ] ; then
+    puppet agent --enable
+    echo "puppet enabled"
+    return 0
+  fi
+
+  # replace dashes and slashes with underscores
+  branch="$(echo "$BRANCH" | sed 's/[/-]/_/g')"
+
+  # if just production, and enable still defaulted then enable puppet later
+  [ $branch == 'production' -a $ENABLE -eq 99 ] && ENABLE=1
+
+  # if ENABLE is still default, set to disable
+  [ $ENABLE -eq 99 ] && ENABLE=0
+
+  # if disable lockfile exists and specified branch is not production
+  #   check if current disable message includes specified branch
+  if [ -e $disableLockFile -a "$branch" != 'production' ]; then
+    disableMsgCur="$( cut -d: -f2- $disableLockFile | sed -e 's/^"//g' -e 's/"}$//g')"
+    if [ $FORCE = 0 ] ; then
+      if [[ $disableMsgCur != *"$branch"* ]]; then
+        echo "Specified branch ($branch) not in puppet disable message: '$disableMsgCur'"
+        if [ $NOPROMPT -eq 0 ] ; then
+          read -n1 -t60 -p "Continue with branch '$branch'? (y/N): " changeBranch
+          echo
+        else
+          changeBranch=n
+        fi
+        [[ ! $changeBranch =~ ^[Yy]$ ]] && return 1
+      fi
+    fi
+  fi
+
+  # check if puppet is running, if so ask if to disable it
+  if [ -e /var/lib/puppet/state/agent_catalog_run.lock ]; then
+    echo "Puppet appears to be running."
+    if [ $FORCE -eq 0 ] ; then
+      read -n1 -t60 -p "Shall I disable puppet so it won't run again? (y/N): " holdPuppet
+      echo
+    else
+      holdPuppet=y
+    fi
+    if [[ $holdPuppet =~ ^[Yy]$ ]]; then
+    puppet agent --disable "holding for branch: $branch"
+      echo "puppet disabled w/ message \"holding for branch: $branch"
+    else
+      echo "Try again later."
+      return 1
+    fi
+    return 0
+  fi
+
+  # inform of branch name to use
+  [ $ENABLE -eq 1 ] && enableStr='yes' || enableStr='no'
+  [ $NOOP   -eq 1 ] && noopStr='yes'   || noopStr='no'
+  echo -e '\n\n'
+  echo "branch: '$branch' | noop: $noopStr | leave enabled: $enableStr"
+  [ "x$PUPOPTS" != 'x' ] && echo "extra options: '$PUPOPTS'"
+
+  # enable puppet for work, run puppet, prefix output as it happens, and
+  # save exit code (vars in subshell not available outside it)
+  puppet agent --enable 2>&1
+  [ $NOOP -eq 1 ] && doNOOP="--noop"
+  (
+    puppet agent -t --environment=$branch $doNOOP $PUPOPTS 2>&1
+    echo $? > /tmp/pup-exit-code
+  ) | while read -r ; do echo -e "$(date +'%F %T') | $REPLY" ; done
+  MyExit=$(cat /tmp/pup-exit-code)
+
+  # if not disabling puppet when done, say so and quit
+  if [ $ENABLE -eq 1 ] ; then
+    echo "puppet left enabled"
+    echo -e '\n\n'
+    return $MyExit
+  fi
+
+  # disabling puppet
+  if [ $NOOP -eq 1 -a "x$disableMsgCur" != 'x' ] ; then
+    disableMsg="$disableMsgCur"
+  else
+    disableMsg="on branch: $branch"
+  fi
+  puppet agent --disable "$disableMsg"
+  echo "puppet disabled w/ msg: '$disableMsg'"
+  echo -e '\n\n'
   return $MyExit
 }
 
-ps1_red="$(    tput setaf 1 )"                                                  
-ps1_green="$(  tput setaf 2 )"                                                  
-ps1_yellow="$( tput setaf 3 )"                                                  
+ps1_red="$(    tput setaf 1 )"
+ps1_green="$(  tput setaf 2 )"
+ps1_yellow="$( tput setaf 3 )"
 ps1_reset="$(  tput sgr0    )"
 
 function ps1_vars {
